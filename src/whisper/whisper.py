@@ -2,7 +2,8 @@ import os
 import json
 from typing import Dict, Any, Tuple
 from pathlib import Path
-
+import io
+from pydub import AudioSegment
 import numpy as np
 import librosa
 from openai import OpenAI
@@ -89,7 +90,14 @@ def transcribe_audio(path: Path) -> str:
 
 
 def extract_audio_features(path: Path) -> Tuple[float, Dict[str, float]]:
-    y, sr = librosa.load(str(path), sr=None)
+    audio = AudioSegment.from_file(str(path), format=path.suffix.replace('.', ''))
+    audio = audio.set_frame_rate(16000).set_channels(1)
+    
+    wav_io = io.BytesIO()
+    audio.export(wav_io, format="wav")
+    wav_io.seek(0)
+    
+    y, sr = librosa.load(wav_io, sr=16000)
     duration = librosa.get_duration(y=y, sr=sr)
 
     energy = y ** 2
@@ -106,8 +114,9 @@ def extract_audio_features(path: Path) -> Tuple[float, Dict[str, float]]:
         f0, _, _ = librosa.pyin(
             y,
             fmin=librosa.note_to_hz("C2"),
-            fmax=librosa.note_to_hz("C7"),
+            fmax=librosa.note_to_hz("C6"),
             sr=sr,
+            frame_length=2048,
         )
         f0_clean = f0[~np.isnan(f0)]
         if len(f0_clean) > 0:
@@ -190,7 +199,6 @@ def analyze_with_gemini(
     )
     return response.text
 
-
 def main():
     deck_json = load_deck_json(DECK_JSON_PATH)
 
@@ -212,7 +220,6 @@ def main():
 
     print("\n--- Gemini JSON 결과 ---")
     print(json_result)
-
 
 if __name__ == "__main__":
     main()
