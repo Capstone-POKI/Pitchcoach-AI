@@ -10,12 +10,14 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
+# === 프로젝트 경로/입출력 파일 설정 ===
 BASE_DIR = Path(__file__).resolve().parents[2]
 AUDIO_FILE = BASE_DIR / "data" / "input" / "sample_sound.m4a"
 DECK_JSON_PATH = BASE_DIR / "data" / "output" / "asleep_irdeck.json"
 PROMPT_PATH = Path(__file__).resolve().with_name("whisper_prompt.text")
-SCENARIO = "창업경진대회"
 
+# === 발표 시나리오(평가 기준/가중치) 설정 ===
+SCENARIO = "창업경진대회"
 SCENARIO_CONFIG = {
     "VC 데모데이": {
         "target_wpm": (150, 190),
@@ -35,24 +37,25 @@ SCENARIO_CONFIG = {
     },
 }
 
+# === Gemini에 넣을 JSON 출력 템플릿(프롬프트) 로드 ===
 with open(PROMPT_PATH, "r", encoding="utf-8") as f:
     IR_PROMPT_TEMPLATE = f.read()
 
+# === 외부 API 클라이언트 초기화(OpenAI Whisper / Gemini Vertex) ===
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 gemini_client = genai.Client(
     vertexai=True,
     project=os.getenv("PROJECT_ID"),
     location=os.getenv("LOCATION"),
 )
 
-
 def load_deck_json(path: Path) -> Dict[str, Any]:
+    # IR Deck 분석 결과(JSON) 로드
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
-
 def build_deck_context_text(deck_json: Dict[str, Any]) -> str:
+    # IR Deck 분석 JSON을 LLM 입력용 "요약 컨텍스트"로 변환
     lines = []
     lines.append("[IR 덱 분석 요약]")
 
@@ -79,8 +82,8 @@ def build_deck_context_text(deck_json: Dict[str, Any]) -> str:
 
     return "\n".join(lines)
 
-
 def transcribe_audio(path: Path) -> str:
+    # Whisper로 음성 -> 텍스트(STT)
     with path.open("rb") as audio_file:
         result = openai_client.audio.transcriptions.create(
             model="whisper-1",
@@ -88,24 +91,26 @@ def transcribe_audio(path: Path) -> str:
         )
     return result.text
 
-
 def extract_audio_features(path: Path) -> Tuple[float, Dict[str, float]]:
+    # 음성을 16kHz/mono로 통일한 뒤, librosa로 음향 특징 추출
     audio = AudioSegment.from_file(str(path), format=path.suffix.replace('.', ''))
     audio = audio.set_frame_rate(16000).set_channels(1)
-    
+
     wav_io = io.BytesIO()
     audio.export(wav_io, format="wav")
     wav_io.seek(0)
-    
+
     y, sr = librosa.load(wav_io, sr=16000)
     duration = librosa.get_duration(y=y, sr=sr)
 
+    # 에너지 변동(강약) + 침묵 비율(말 끊김/공백)을 간단 지표로 계산
     energy = y ** 2
     energy_std = float(np.std(energy))
 
     thresh = np.percentile(energy, 20)
     silence_ratio = float(np.mean(energy < thresh))
 
+    # 피치(억양) 특징: 평균/표준편차/범위
     pitch_mean = 0.0
     pitch_std = 0.0
     pitch_range = 0.0
@@ -124,6 +129,7 @@ def extract_audio_features(path: Path) -> Tuple[float, Dict[str, float]]:
             pitch_std = float(np.std(f0_clean))
             pitch_range = float(np.max(f0_clean) - np.min(f0_clean))
     except Exception:
+        # 피치 추정 실패 시 안전하게 0값 유지
         pass
 
     return duration, {
@@ -135,14 +141,13 @@ def extract_audio_features(path: Path) -> Tuple[float, Dict[str, float]]:
         "silence_ratio": silence_ratio,
     }
 
-
 def calc_wpm(transcript: str, duration_sec: float) -> float:
+    # WPM(분당 단어수) 계산: 전사 텍스트 길이 / 발표 시간
     words = transcript.strip().split()
     if duration_sec <= 0 or not words:
         return 0.0
     minutes = duration_sec / 60.0
     return round(len(words) / minutes, 1)
-
 
 def analyze_with_gemini(
     transcript_text: str,
@@ -151,6 +156,7 @@ def analyze_with_gemini(
     features: Dict[str, float],
     deck_json: Dict[str, Any],
 ) -> str:
+    # 문서 분석(JSON) + 음성 지표 + 시나리오 기준을 합쳐서 Gemini 프롬프트 구성
     deck_ctx = build_deck_context_text(deck_json)
     scenario_cfg = SCENARIO_CONFIG.get(scenario, SCENARIO_CONFIG["VC 데모데이"])
     target_low, target_high = scenario_cfg["target_wpm"]
@@ -158,7 +164,6 @@ def analyze_with_gemini(
 
     audio_ctx = f"""
 [발표 시나리오 설정]
-
 - 현재 분석 대상 발표 상황: {scenario}
 - 이 상황에서 권장 말하기 속도 범위: 약 {target_low} ~ {target_high} WPM
 - 이 상황에서의 평가 중요도 비중:
@@ -167,7 +172,6 @@ def analyze_with_gemini(
   · 명료성(clarity): {int(imp["clarity"] * 100)}%
 
 [음성 분석 요약]
-
 - 실제 측정 말하기 속도(WPM): {wpm}
 - 전체 음성 길이(초): {features.get("duration", 0):.1f}
 - 피치 평균(pitch_mean, Hz): {features.get("pitch_mean", 0):.2f}
@@ -176,19 +180,14 @@ def analyze_with_gemini(
 - 에너지 표준편차(energy_std): {features.get("energy_std", 0):.4f}
 - 침묵 비율(silence_ratio): {features.get("silence_ratio", 0):.3f}
 
-위 정보를 참고하여
-- '말하기_속도_WPM' 필드에는 실제 측정값인 {wpm}을 넣으세요.
-- '억양_강조_안정성'은 주로 피치 평균/표준편차/범위와 에너지 변동성을 기반으로,
-- '문장_명료성'과 '불필요한_말버릇'은 침묵 비율과 속도(WPM)를 참고하여,
-- 해당 시나리오의 권장 속도 범위와 중요도(weight)를 고려해
-구체적으로 평가하세요.
-
 최종 출력 형식은 반드시 지정된 JSON 구조만 사용하세요.
 """
 
+    # 최종 프롬프트 = (덱 컨텍스트 + 음성 컨텍스트) + (JSON 템플릿에 전사 텍스트 삽입)
     prompt_prefix = deck_ctx + "\n\n" + audio_ctx + "\n\n"
     final_prompt = prompt_prefix + IR_PROMPT_TEMPLATE.replace('{{$json["text"]}}', transcript_text)
 
+    # Gemini 응답을 JSON으로 강제(response_mime_type)하여 후처리/저장에 유리하게 만듦
     response = gemini_client.models.generate_content(
         model="gemini-2.0-flash",
         contents=final_prompt,
@@ -200,6 +199,7 @@ def analyze_with_gemini(
     return response.text
 
 def main():
+    # 1) 덱 분석 결과 로드 -> 2) 음성 전사 -> 3) 음향 특징 + WPM -> 4) Gemini 코칭 JSON 생성
     deck_json = load_deck_json(DECK_JSON_PATH)
 
     print("🎧 Whisper로 음성 → 텍스트 변환 중...")
